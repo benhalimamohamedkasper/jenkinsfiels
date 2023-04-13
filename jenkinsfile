@@ -1,0 +1,230 @@
+pipeline {
+    agent {
+        label 'dockerized_preprod'
+    }
+    environment {
+        BRANCH = ""
+        // SECRET_FILE = credentials('id_rsa')
+        DOCKER_IMAGE_NAME = 'notifications-api'
+        DOCKER_CONTAINER_NAME = 'notifications-api'
+        APP_PORT = '7070'
+        REPOSITORY_URL = 'https://gitlab.com/Kaspr/notifications-api'
+        // DOCKER_REGISTRY = sh(script: "echo ${REPOSITORY_URL} | cut -d'/' -f3 | sed 's/gitlab.com/registry.gitlab.com/g'", returnStdout: true).trim()
+        STATUS = ""
+        CONTAINER_ID =""
+        DOCKER_REGISTRY = "registry.gitlab.com/kaspr/"
+        PUSH_TAG = "stable"
+        REPOSITORY_NAME = ""
+        Username=""
+        
+        
+        
+
+    }
+    stages {
+        stage('Get Branch Name') {
+            steps {
+                script {
+                    if (env.BRANCH_NAME == null || env.BRANCH_NAME.trim() == '') {
+                        BRANCH = "docker"
+                    } else {
+                        BRANCH = env.BRANCH_NAME
+                    }
+                    sh "printenv | sort"
+                    echo "Branch name: ${BRANCH}"
+                    echo " gitlabUserName == ${env.gitlabUserName}"
+                    echo "gitlabTargetBranch === ${env.gitlabTargetBranch}"
+                    if (env.gitlabUserName == null || env.gitlabUserName.trim() == '') {
+                        Username = "built_via_GUI_user_${env.USER}"
+                    } else {
+                        
+                        Username = env.gitlabUserName.replaceAll(" ", "_")
+                    }
+                    echo "Username: ${Username}"
+                    env.BUILD_TAG= "${BRANCH}-${env.BUILD_NUMBER}-${Username}"
+                    echo "BUILD_TAG = ${BUILD_TAG}"
+                    
+                }
+        
+            }
+        }
+        stage('notify'){
+            steps{
+                // Send notification on build start
+               slackSend (color: '#FFFF00', message: "Starting build ${env.JOB_NAME} #${env.BUILD_NUMBER} / branch : ${BRANCH} process / User => ${Username}. Please wait for further updates.", channel: 'jenkins', tokenCredentialId: 'slack_integration_Token_Credential_ID')
+            }
+        }
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+        stage('Checkout') {
+            steps {
+                checkout scmGit(branches: [[name: "*/${BRANCH}"]], extensions: [], userRemoteConfigs: [[credentialsId: 'b37fe0dd-555b-4a2b-a114-f4f6e8e23986', url: "${env.REPOSITORY_URL}"]])
+            }
+        }
+        // stage('Copy secret file to working directory') {
+        //     steps {
+        //         script {
+        //             def REPOSITORY_NAME = sh(returnStdout: true, script: "echo ${REPOSITORY_URL} | sed 's|.*/||'")
+        //             echo "Repository name: ${REPOSITORY_NAME}"
+        //             if (fileExists('id_rsa')) {
+        //                 sh 'rm id_rsa'
+        //             }
+        //             sh "mv $SECRET_FILE  id_rsa"
+        //         }
+        //     }
+        // }
+        stage('Create .env_docker') {
+         steps {
+            
+                // script {
+                //     if (fileExists('.env')) {
+                //         sh 'rm .env'
+                //     }
+
+                // }
+                echo "BUILD_TAG = ${BUILD_TAG}"
+                
+                sh 'echo "DOCKER_IMAGE_NAME=\\"$DOCKER_IMAGE_NAME\\"" >> .env'
+                sh 'echo "DOCKER_CONTAINER_NAME=\\"$DOCKER_CONTAINER_NAME\\"" >> .env'
+                sh 'echo "APP_PORT=\\"$APP_PORT\\"" >> .env'
+                sh 'echo "BUILD_TAG=\\"${BUILD_TAG}\\"" >> .env'
+                
+                
+
+                
+                
+            }
+        }
+        stage('Cleanup') {
+            steps {
+                script {
+                    try {
+                        sh "docker container stop ${DOCKER_CONTAINER_NAME}"
+                    } catch (err) {
+                        // ignore if container is not running
+                    }
+                    
+                    try {
+                        sh "docker container rm ${DOCKER_CONTAINER_NAME}"
+                    } catch (err) {
+                        // ignore if container does not exist
+                    }
+                    
+                    try {
+                        
+                        sh "docker rmi  \$(docker images -q ${DOCKER_IMAGE_NAME})"
+                    } catch (err) {
+                        // ignore if image does not exist
+                    }
+                    try {
+                       
+                        sh "docker rmi \$(docker images -q ${env.DOCKER_REGISTRY}${DOCKER_IMAGE_NAME})"
+                    } catch (err) {
+                        // ignore if image does not exist
+                    }
+                }
+            }
+        }
+        stage('build image with docker compose') {
+            steps { 
+                sh "sudo docker compose -f docker-compose.yml up -d"
+                sh 'sleep 10'
+            }
+        }
+        stage('container health') {
+            steps { 
+                // sh 'STATUS=$(docker inspect  --format=\'{{.State.ExitCode}}\' ${DOCKER_CONTAINER_NAME})'
+                // sh "CONTAINER_ID=\$(docker ps -q --filter \"name=${DOCKER_CONTAINER_NAME}\")"
+                script {
+                 STATUS = sh(script: 'docker inspect  --format=\"{{.State.ExitCode}}\" ${DOCKER_CONTAINER_NAME}', returnStdout: true).trim()
+                
+                 CONTAINER_ID = sh(script: 'docker ps -q --filter \"name=${DOCKER_CONTAINER_NAME}\"', returnStdout: true).trim()
+                 sh "echo Container ID: $CONTAINER_ID"
+                 echo "Container exit code: $STATUS"
+                 echo "====-----------===="
+                 sh "docker logs ${DOCKER_CONTAINER_NAME} > container-logs.txt"
+                 sh "cat container-logs.txt"
+                 echo "====++++++++===="
+                
+                    if (STATUS == '0') {
+                        echo "Container is running"
+                        
+                    } else {
+                        error "Docker container exited with status code ${env.STATUS}."
+                    }
+                }
+
+                
+            }
+        }
+        stage('push image to gitlab registry') {
+            steps { 
+                script {
+                    
+
+
+
+
+                    withCredentials([usernamePassword(credentialsId: 'b37fe0dd-555b-4a2b-a114-f4f6e8e23986', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
+                        def dockerImage = "${env.DOCKER_IMAGE_NAME}:${env.BUILD_TAG}"
+                        sh "echo $PASSWORD | docker login ${env.DOCKER_REGISTRY} -u $USERNAME --password-stdin"
+                        sh "docker tag ${dockerImage} ${env.DOCKER_REGISTRY}${dockerImage}"
+                        sh "echo ${env.DOCKER_REGISTRY}"
+                        sh "docker push ${env.DOCKER_REGISTRY}${dockerImage}"
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                def buildStatus = currentBuild.result
+                // Check build status and send notifications accordingly
+                
+                    
+                    switch (buildStatus) {
+                        case 'SUCCESS':
+                            slackUploadFile (filePath: 'container-logs.txt', initialComment: 'container logs', channel: 'jenkins', tokenCredentialId: 'slack_integration_Token_Credential_ID')
+                            slackSend (color: '#00FF00', message: "Build ${env.JOB_NAME} #${env.BUILD_NUMBER} branch : $BRANCH process completed successfully.", channel: 'jenkins', tokenCredentialId: 'slack_integration_Token_Credential_ID')
+                            break
+                        case 'ABORTED':
+                            slackSend (color: '#FF0000', message: "Build ${env.JOB_NAME} #${env.BUILD_NUMBER} branch : $BRANCH process aborted. Please check logs for details.", channel: 'jenkins', tokenCredentialId: 'slack_integration_Token_Credential_ID')
+                            break
+                        case 'NOT_BUILT':
+                            slackSend (color: '#FFA500', message: "Build ${env.JOB_NAME} #${env.BUILD_NUMBER} branch : $BRANCH not started due to a configuration issue. Please fix and try again.", channel: 'jenkins', tokenCredentialId: 'slack_integration_Token_Credential_ID')
+                            break
+                        case 'UNSTABLE':
+                            slackSend (color: '#FFA500', message: "Build ${env.JOB_NAME} #${env.BUILD_NUMBER} branch : $BRANCH process completed, but some tests failed. Please investigate the issues.", channel: 'jenkins', tokenCredentialId: 'slack_integration_Token_Credential_ID')
+                            break
+                        case 'FAILURE':
+                                catchError {
+                                    // def buildLog = currentBuild.rawBuild.getLogFile().toString()
+                                    def attachment = [
+                                        fallback: "Build failed: ${env.JOB_NAME} #${env.BUILD_NUMBER} branch : $BRANCH",
+                                        color: "#ff0000",
+                                        title: "Build failed: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                                        //  fields: [
+                                        //     [title: "Error message", value: ${buildLog}, short: false]
+                                        //     ]
+                                    ]
+                                    // slackUploadFile channel: 'jenkins', credentialId: 'slack_integration_Token_Credential_ID', filePath: 'console_output.txt', initialComment: 'log_file'
+                                    slackUploadFile channel: 'jenkins', filePath: './container-logs.txt', initialComment: 'Docker container logs:', credentialId: 'slack_integration_Token_Credential_ID'
+                                    slackSend (color: '#FF0000', message: "Build ${env.JOB_NAME} #${env.BUILD_NUMBER} branch : ${BRANCH} process failed. Please check logs for details. ${env.BUILD_URL}/console", channel: 'jenkins', tokenCredentialId: 'slack_integration_Token_Credential_ID', attachments: [attachment])
+                                    }
+
+                            break
+                        default:
+                            break
+                    }
+                
+            }
+        }
+    }
+}
+
+
+
